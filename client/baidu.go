@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -454,18 +455,22 @@ func (c *BaiduClient) uploadFileOnce(localPath, remotePath string) (int64, error
 	}
 	defer f.Close()
 
-	pr, pw := io.Pipe()
-	writer := multipart.NewWriter(pw)
-	go func() {
-		part, err := writer.CreateFormFile("file", filepath.Base(localPath))
-		if err == nil {
-			_, err = io.Copy(part, f)
-		}
-		if err == nil {
-			err = writer.Close()
-		}
-		pw.CloseWithError(err)
-	}()
+	fi, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+
+	// 预生成 multipart 头部与结尾，文件内容保持流式读取（不占大内存）。
+	// 必须显式设置 Content-Length：百度 PCS 上传接口不接受 chunked 传输编码，
+	// 否则统一返回 HTTP 503 / error_code 31212。
+	var head bytes.Buffer
+	writer := multipart.NewWriter(&head)
+	if _, err := writer.CreateFormFile("file", filepath.Base(localPath)); err != nil {
+		return 0, err
+	}
+	foot := fmt.Sprintf("\r\n--%s--\r\n", writer.Boundary())
+
+	body := io.MultiReader(&head, f, strings.NewReader(foot))
 
 	reqURL := fmt.Sprintf(
 		"https://d.pcs.baidu.com/rest/2.0/pcs/file?method=upload&path=%s&access_token=%s&ondup=overwrite&app_id=250528",
@@ -473,22 +478,21 @@ func (c *BaiduClient) uploadFileOnce(localPath, remotePath string) (int64, error
 		url.QueryEscape(token),
 	)
 
-	req, err := http.NewRequest("POST", reqURL, pr)
+	req, err := http.NewRequest("POST", reqURL, body)
 	if err != nil {
-		pr.Close()
 		return 0, err
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	req.Header.Set("User-Agent", "pan.baidu.com")
+	req.ContentLength = int64(head.Len()) + fi.Size() + int64(len(foot))
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		pr.Close()
 		return 0, fmt.Errorf("上传网络请求失败: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	respBody, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		if err := c.RefreshToken(); err == nil {
@@ -497,13 +501,13 @@ func (c *BaiduClient) uploadFileOnce(localPath, remotePath string) (int64, error
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("上传失败 HTTP %d: %s", resp.StatusCode, string(body))
+		return 0, fmt.Errorf("上传失败 HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var res struct {
 		Mtime int64 `json:"mtime"`
 	}
-	_ = json.Unmarshal(body, &res)
+	_ = json.Unmarshal(respBody, &res)
 	if res.Mtime == 0 {
 		res.Mtime = time.Now().Unix()
 	}
@@ -520,15 +524,16 @@ func (c *BaiduClient) DeleteFile(remotePath string) error {
 		token = c.GetAccessToken()
 	}
 
-	fileListJSON, _ := json.Marshal([]string{remotePath})
+	// 使用与上传同源的 PCS 删除接口：xpan filemanager 的元数据对 PCS 上传的文件
+	// 长期不可见（返回 errno 12），会导致本工具上传的文件无法被删除
 	reqURL := fmt.Sprintf(
-		"https://pan.baidu.com/rest/2.0/xpan/file?method=filemanager&opera=delete&access_token=%s",
+		"https://d.pcs.baidu.com/rest/2.0/pcs/file?method=delete&access_token=%s&app_id=250528",
 		url.QueryEscape(token),
 	)
 
 	data := url.Values{}
+	data.Set("path", remotePath)
 	data.Set("async", "0")
-	data.Set("filelist", string(fileListJSON))
 
 	req, err := http.NewRequest("POST", reqURL, bytes.NewBufferString(data.Encode()))
 	if err != nil {
@@ -548,15 +553,27 @@ func (c *BaiduClient) DeleteFile(remotePath string) error {
 		return err
 	}
 
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		if err := c.RefreshToken(); err == nil {
+			return c.DeleteFile(remotePath)
+		}
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("删除失败 HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	// PCS 删除成功时返回 {"request_id":...}（无 errno 字段）；失败时返回带 error_code 的错误
 	var res struct {
-		Errno int `json:"errno"`
+		Errno     int `json:"errno"`
+		ErrorCode int `json:"error_code"`
 	}
 	if err := json.Unmarshal(body, &res); err != nil {
 		return err
 	}
 
-	if res.Errno != 0 {
-		return fmt.Errorf("删除失败 errno: %d, response: %s", res.Errno, string(body))
+	if res.Errno != 0 || res.ErrorCode != 0 {
+		return fmt.Errorf("删除失败 errno: %d, error_code: %d, response: %s", res.Errno, res.ErrorCode, string(body))
 	}
 
 	return nil
