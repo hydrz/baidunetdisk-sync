@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
 一键初始化配置流水线：
-1. 自动从本机官方网盘客户端提取 BDUSS（备查）
-2. 引导配置百度网盘 Refresh Token
-3. 设置宿主机目录权限与 .env 环境变量
-4. 启动 OpenList 容器并通过 API 全自动挂载同步空间 (/_pcs_.workspace)
-5. 启动 Rclone 双向同步引擎
+1. 引导配置百度网盘 Refresh Token
+2. 设置宿主机目录权限与 .env 环境变量
+3. 启动 OpenList 容器并通过 REST API 自动挂载“同步空间”(/_pcs_.workspace)
+4. 启动 Rclone 守护容器执行双向增量同步
 """
 import os
 import sys
 import time
 import json
-import sqlite3
 import subprocess
 import urllib.request
 import urllib.error
@@ -19,23 +17,7 @@ import urllib.error
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(PROJECT_DIR)
 
-def get_bduss():
-    cookie_db = os.path.expanduser('~/.config/baidunetdisk/Cookies')
-    if not os.path.exists(cookie_db):
-        return None
-    try:
-        conn = sqlite3.connect(cookie_db)
-        c = conn.cursor()
-        c.execute("SELECT value FROM cookies WHERE name='BDUSS' LIMIT 1")
-        row = c.fetchone()
-        conn.close()
-        if row and row[0]:
-            return row[0]
-    except Exception:
-        pass
-    return None
-
-def init_env(bduss, refresh_token=None):
+def init_env(refresh_token=None):
     env_file = os.path.join(PROJECT_DIR, '.env')
     example_file = os.path.join(PROJECT_DIR, '.env.example')
     
@@ -51,14 +33,11 @@ def init_env(bduss, refresh_token=None):
         content += f"\nUID={uid}\nGID={gid}\n"
     
     lines = content.splitlines()
-    has_bduss = any(l.startswith('BAIDU_BDUSS=') for l in lines)
     has_token = any(l.startswith('BAIDU_REFRESH_TOKEN=') for l in lines)
     
     new_lines = []
     for l in lines:
-        if l.startswith('BAIDU_BDUSS=') and bduss:
-            new_lines.append(f'BAIDU_BDUSS="{bduss}"')
-        elif l.startswith('BAIDU_REFRESH_TOKEN=') and refresh_token:
+        if l.startswith('BAIDU_REFRESH_TOKEN=') and refresh_token:
             new_lines.append(f'BAIDU_REFRESH_TOKEN="{refresh_token}"')
         else:
             new_lines.append(l)
@@ -181,7 +160,7 @@ def configure_storage(port, admin_pwd, refresh_token, workspace_path):
         with urllib.request.urlopen(req) as resp:
             data = json.loads(resp.read().decode('utf-8'))
             if data.get('code') == 200:
-                print(f"[+] 百度网盘“同步空间”配置成功！")
+                print(f"[+] 百度网盘“同步空间”存储已成功生效！")
                 return True
             else:
                 print(f"[!] 存储配置接口提示: {data.get('message')}")
@@ -195,12 +174,7 @@ def main():
     print(" 百度网盘 Linux 双向离线同步系统 (OpenList + Rclone)")
     print("=" * 60)
 
-    # 1. 自动提取本地已登录客户端的 BDUSS
-    bduss = get_bduss()
-    if bduss:
-        print(f"[+] 已检测到官方客户端登录状态 (BDUSS: {bduss[:15]}...)")
-    
-    # 2. 检查或引导配置 Refresh Token
+    # 1. 检查或引导配置 Refresh Token
     env = load_env()
     refresh_token = env.get('BAIDU_REFRESH_TOKEN', '')
     
@@ -218,8 +192,8 @@ def main():
         except (EOFError, KeyboardInterrupt):
             pass
 
-    # 3. 初始化 .env 和宿主机目录权限
-    init_env(bduss, refresh_token)
+    # 2. 初始化 .env 和宿主机目录权限
+    init_env(refresh_token)
     env = load_env()
     port = int(env.get('OPENLIST_PORT', 5244))
     admin_pwd = env.get('OPENLIST_ADMIN_PASSWORD', 'admin123')
@@ -233,7 +207,7 @@ def main():
         except Exception:
             pass
 
-    # 4. 启动 OpenList 容器
+    # 3. 启动 OpenList 容器
     print("\n[+] 正在启动 OpenList 服务容器...")
     subprocess.run(["docker", "compose", "up", "-d", "openlist"], check=True)
 
@@ -241,10 +215,10 @@ def main():
         print("[!] OpenList 服务启动超时，请检查 docker compose logs openlist。")
         sys.exit(1)
 
-    # 5. 配置百度网盘同步空间存储
+    # 4. 配置百度网盘同步空间存储
     configure_storage(port, admin_pwd, refresh_token, workspace_path)
 
-    # 6. 启动 Rclone 容器
+    # 5. 启动 Rclone 容器
     print("\n[+] 正在启动 Rclone 双向同步容器...")
     subprocess.run(["docker", "compose", "up", "-d", "rclone-sync"], check=True)
 

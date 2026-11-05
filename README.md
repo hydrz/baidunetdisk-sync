@@ -1,6 +1,6 @@
 # 百度网盘 Linux 双向离线同步系统 (OpenList + Rclone)
 
-专为百度网盘 Linux 客户端打造的“同步空间 (Sync Space)”双向离线同步套件。
+专为 Linux 环境打造的百度网盘“同步空间 (Sync Space)”双向离线同步套件。
 
 ```mermaid
 flowchart LR
@@ -27,6 +27,7 @@ flowchart LR
 ## 🌟 特性
 
 - **精准对接同步空间**：直连百度网盘私有同步空间根路径 `/_pcs_.workspace`。
+- **纯官方 OAuth 授权**：无需提取任何 Cookie 或本地客户端凭证，通过官方 Refresh Token 安全鉴权。
 - **真正的双向增量同步**：基于 `rclone bisync`，支持双端修改同步、删除同步与冲突保护。
 - **状态不丢失**：工作区元数据与对比快照持久化保存在本地挂载卷，容器重启无需重新 `--resync`。
 - **全自动化运维**：集成一键配置脚本、过滤规则、即时手动同步与系统健康状态监测。
@@ -36,22 +37,18 @@ flowchart LR
 
 ## 🚀 快速上手
 
-### 1. 前置要求
-- 本机已安装并登录百度网盘官方 Linux 客户端。
-- 已安装 Docker 与 Docker Compose。
-
-### 2. 获取授权 Token
+### 1. 获取授权 Token
 访问 OpenList 官方授权页面获取令牌：
 👉 **https://api.oplist.org/**
 - 选择 **百度网盘**，点击授权登录并复制生成的 **Refresh Token**。
 
-### 3. 一键初始化与启动
+### 2. 一键初始化与启动
 在项目根目录下执行：
 ```bash
 python3 scripts/setup.py
 ```
 根据提示粘贴获取到的 Refresh Token，脚本将全自动完成：
-- 自动提取并配置环境变量与目录权限。
+- 自动生成 `.env` 并修复宿主机数据目录权限。
 - 启动 OpenList 容器并通过 REST API 自动挂载 `/_pcs_.workspace`。
 - 启动 Rclone 守护容器执行初次对齐并进入后台轮询。
 
@@ -81,7 +78,6 @@ baidunetdisk-sync/
 ├── README.md                # 完整技术与运维指南
 ├── data/                    # 数据库与 Rclone 状态持久化目录（自动创建）
 └── scripts/
-    ├── extract-cookie.py    # 从客户端读取凭证
     ├── setup.py             # 一键自动初始化安装流水线
     ├── status.sh            # 容器与 WebDAV 状态检测脚本
     ├── sync-daemon.sh       # Rclone 容器后台同步守护进程
