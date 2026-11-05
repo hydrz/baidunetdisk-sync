@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-一键初始化配置脚本：
-1. 自动从本机官方网盘客户端提取 BDUSS
-2. 生成 .env 配置文件
-3. 启动 OpenList 容器
-4. 自动通过 OpenList REST API 添加“百度网盘同步空间”(/_pcs_.workspace)
-5. 启动 Rclone 容器开启双向同步
+一键初始化配置流水线：
+1. 自动从本机官方网盘客户端提取 BDUSS（备查）
+2. 引导配置百度网盘 Refresh Token
+3. 设置宿主机目录权限与 .env 环境变量
+4. 启动 OpenList 容器并通过 API 全自动挂载同步空间 (/_pcs_.workspace)
+5. 启动 Rclone 双向同步引擎
 """
 import os
 import sys
@@ -22,7 +22,6 @@ os.chdir(PROJECT_DIR)
 def get_bduss():
     cookie_db = os.path.expanduser('~/.config/baidunetdisk/Cookies')
     if not os.path.exists(cookie_db):
-        print(f"[!] 找不到官方客户端 Cookie 数据库: {cookie_db}")
         return None
     try:
         conn = sqlite3.connect(cookie_db)
@@ -32,11 +31,11 @@ def get_bduss():
         conn.close()
         if row and row[0]:
             return row[0]
-    except Exception as e:
-        print(f"[!] 读取 Cookie 异常: {e}")
+    except Exception:
+        pass
     return None
 
-def init_env(bduss):
+def init_env(bduss, refresh_token=None):
     env_file = os.path.join(PROJECT_DIR, '.env')
     example_file = os.path.join(PROJECT_DIR, '.env.example')
     
@@ -44,30 +43,36 @@ def init_env(bduss):
     gid = os.getgid()
     
     if os.path.exists(env_file):
-        print("[+] .env 文件已存在，保留现有配置。")
         with open(env_file, 'r', encoding='utf-8') as f:
             content = f.read()
     else:
-        print("[+] 生成 .env 文件...")
         with open(example_file, 'r', encoding='utf-8') as f:
             content = f.read()
         content += f"\nUID={uid}\nGID={gid}\n"
     
-    if bduss and 'BAIDU_BDUSS=' in content:
-        lines = []
-        for line in content.splitlines():
-            if line.startswith('BAIDU_BDUSS='):
-                lines.append(f'BAIDU_BDUSS="{bduss}"')
-            else:
-                lines.append(line)
-        content = '\n'.join(lines) + '\n'
+    lines = content.splitlines()
+    has_bduss = any(l.startswith('BAIDU_BDUSS=') for l in lines)
+    has_token = any(l.startswith('BAIDU_REFRESH_TOKEN=') for l in lines)
+    
+    new_lines = []
+    for l in lines:
+        if l.startswith('BAIDU_BDUSS=') and bduss:
+            new_lines.append(f'BAIDU_BDUSS="{bduss}"')
+        elif l.startswith('BAIDU_REFRESH_TOKEN=') and refresh_token:
+            new_lines.append(f'BAIDU_REFRESH_TOKEN="{refresh_token}"')
+        else:
+            new_lines.append(l)
+            
+    if not has_token and refresh_token:
+        new_lines.append(f'BAIDU_REFRESH_TOKEN="{refresh_token}"')
+        
+    content = '\n'.join(new_lines) + '\n'
 
     with open(env_file, 'w', encoding='utf-8') as f:
         f.write(content)
 
     sync_dir = os.path.expanduser('~/.baidunetdisk')
     os.makedirs(sync_dir, exist_ok=True)
-    print(f"[+] 本地同步目录已就绪: {sync_dir}")
     return env_file
 
 def load_env():
@@ -97,8 +102,8 @@ def wait_for_openlist(port, timeout=60):
             time.sleep(2)
     return False
 
-def setup_openlist_storage(port, admin_pwd, bduss, workspace_path):
-    print("[+] 正在通过 OpenList API 登录并挂载同步空间...")
+def configure_storage(port, admin_pwd, refresh_token, workspace_path):
+    print("[+] 正在连接 OpenList API 配置同步空间存储...")
     # 1. 登录获取 Token
     login_url = f"http://127.0.0.1:{port}/api/auth/login"
     login_data = json.dumps({"username": "admin", "password": admin_pwd}).encode('utf-8')
@@ -110,34 +115,31 @@ def setup_openlist_storage(port, admin_pwd, bduss, workspace_path):
             if data.get('code') != 200:
                 print(f"[!] OpenList 登录失败: {data}")
                 return False
-            token = data['data']['token']
+            auth_token = data['data']['token']
     except Exception as e:
         print(f"[!] 登录请求异常: {e}")
         return False
 
-    # 2. 检查存储是否已存在
-    list_url = f"http://127.0.0.1:{port}/api/admin/storage/list"
-    req = urllib.request.Request(list_url, headers={'Authorization': token})
-    try:
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-            storages = data.get('data', {}).get('content', [])
-            for st in storages:
-                if st.get('mount_path') == f"/{workspace_path}":
-                    print(f"[+] 存储 /{workspace_path} 已存在，跳过创建。")
-                    return True
-    except Exception as e:
-        print(f"[!] 检查现有存储异常: {e}")
-
-    # 3. 创建百度网盘同步空间存储
-    create_url = f"http://127.0.0.1:{port}/api/admin/storage/create"
     addition_dict = {
-        "cookie": f"BDUSS={bduss};",
         "root_folder_path": "/_pcs_.workspace",
+        "order_by": "name",
+        "order_direction": "asc",
         "download_api": "official",
-        "custom_download_url": "",
-        "download_domain": ""
+        "use_online_api": True,
+        "api_url_address": "https://api.oplist.org/baiduyun/renewapi",
+        "client_id": "",
+        "client_secret": "",
+        "custom_crack_ua": "netdisk",
+        "refresh_token": refresh_token or "",
+        "upload_thread": "3",
+        "upload_timeout": 60,
+        "upload_api": "https://d.pcs.baidu.com",
+        "use_dynamic_upload_api": True,
+        "custom_upload_part_size": 0,
+        "low_bandwith_upload_mode": False,
+        "only_list_video_file": False
     }
+
     storage_payload = {
         "mount_path": f"/{workspace_path}",
         "order": 0,
@@ -151,22 +153,41 @@ def setup_openlist_storage(port, admin_pwd, bduss, workspace_path):
         "addition": json.dumps(addition_dict)
     }
 
+    # 检查是否已存在存储
+    list_url = f"http://127.0.0.1:{port}/api/admin/storage/list"
+    req = urllib.request.Request(list_url, headers={'Authorization': auth_token})
+    existing_id = None
+    try:
+        with urllib.request.urlopen(req) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            storages = data.get('data', {}).get('content', [])
+            for st in storages:
+                if st.get('mount_path') == f"/{workspace_path}":
+                    existing_id = st.get('id')
+                    break
+    except Exception:
+        pass
+
+    target_url = f"http://127.0.0.1:{port}/api/admin/storage/update" if existing_id else f"http://127.0.0.1:{port}/api/admin/storage/create"
+    if existing_id:
+        storage_payload["id"] = existing_id
+
     req = urllib.request.Request(
-        create_url,
+        target_url,
         data=json.dumps(storage_payload).encode('utf-8'),
-        headers={'Content-Type': 'application/json', 'Authorization': token}
+        headers={'Content-Type': 'application/json', 'Authorization': auth_token}
     )
     try:
         with urllib.request.urlopen(req) as resp:
             data = json.loads(resp.read().decode('utf-8'))
             if data.get('code') == 200:
-                print(f"[+] 百度网盘“同步空间”(/_pcs_.workspace) 已成功挂载到 /{workspace_path}！")
+                print(f"[+] 百度网盘“同步空间”配置成功！")
                 return True
             else:
-                print(f"[!] 挂载存储接口返回错误: {data}")
+                print(f"[!] 存储配置接口提示: {data.get('message')}")
                 return False
     except Exception as e:
-        print(f"[!] 挂载存储请求异常: {e}")
+        print(f"[!] 存储配置请求异常: {e}")
         return False
 
 def main():
@@ -174,46 +195,66 @@ def main():
     print(" 百度网盘 Linux 双向离线同步系统 (OpenList + Rclone)")
     print("=" * 60)
 
+    # 1. 自动提取本地已登录客户端的 BDUSS
     bduss = get_bduss()
-    if not bduss:
-        print("[!] 未能自动获取 BDUSS，请先启动并登录百度网盘官方 Linux 客户端。")
-        sys.exit(1)
-    print(f"[+] 成功提取到客户端 BDUSS (长度: {len(bduss)})")
+    if bduss:
+        print(f"[+] 已检测到官方客户端登录状态 (BDUSS: {bduss[:15]}...)")
+    
+    # 2. 检查或引导配置 Refresh Token
+    env = load_env()
+    refresh_token = env.get('BAIDU_REFRESH_TOKEN', '')
+    
+    if not refresh_token:
+        print("\n" + "-" * 60)
+        print("👉 首次配置提示：获取百度网盘授权令牌 (Refresh Token)")
+        print("1. 浏览器打开 OpenList 官方授权页面: https://api.oplist.org/")
+        print("2. 点击「百度网盘」并授权登录")
+        print("3. 授权成功后复制生成的 Refresh Token")
+        print("-" * 60)
+        try:
+            val = input("请输入 Refresh Token (直接回车可稍后在网页端填写): ").strip()
+            if val:
+                refresh_token = val
+        except (EOFError, KeyboardInterrupt):
+            pass
 
-    init_env(bduss)
+    # 3. 初始化 .env 和宿主机目录权限
+    init_env(bduss, refresh_token)
     env = load_env()
     port = int(env.get('OPENLIST_PORT', 5244))
     admin_pwd = env.get('OPENLIST_ADMIN_PASSWORD', 'admin123')
     workspace_path = env.get('WEBDAV_WORKSPACE_PATH', 'workspace')
 
-    # 确保宿主机持久化目录存在并赋予读写权限（OpenList v4.1.0+ 内部使用 UID 1001 运行）
     for d in ['data/openlist', 'data/rclone']:
-        dir_path = os.path.join(PROJECT_DIR, d)
-        os.makedirs(dir_path, exist_ok=True)
+        path = os.path.join(PROJECT_DIR, d)
+        os.makedirs(path, exist_ok=True)
         try:
-            os.chmod(dir_path, 0o777)
+            os.chmod(path, 0o777)
         except Exception:
             pass
 
-    print("\n[+] 正在启动 OpenList 容器...")
+    # 4. 启动 OpenList 容器
+    print("\n[+] 正在启动 OpenList 服务容器...")
     subprocess.run(["docker", "compose", "up", "-d", "openlist"], check=True)
 
     if not wait_for_openlist(port):
-        print("[!] OpenList 容器启动超时，请检查 docker compose logs openlist。")
+        print("[!] OpenList 服务启动超时，请检查 docker compose logs openlist。")
         sys.exit(1)
 
-    # 尝试配置 storage
-    setup_openlist_storage(port, admin_pwd, bduss, workspace_path)
+    # 5. 配置百度网盘同步空间存储
+    configure_storage(port, admin_pwd, refresh_token, workspace_path)
 
+    # 6. 启动 Rclone 容器
     print("\n[+] 正在启动 Rclone 双向同步容器...")
     subprocess.run(["docker", "compose", "up", "-d", "rclone-sync"], check=True)
 
     print("\n" + "=" * 60)
-    print("🎉 部署完成！双向同步服务已在后台运行。")
-    print(f"👉 本地同步目录: {env.get('LOCAL_SYNC_DIR')}")
+    print("🎉 部署完成！")
+    print(f"👉 本地同步目录: ~/.baidunetdisk")
     print(f"👉 OpenList 面板: http://127.0.0.1:{port} (用户名: admin, 密码: {admin_pwd})")
-    print(f"👉 查看同步日志: docker compose logs -f rclone-sync")
-    print(f"👉 即时手动同步: ./scripts/manual-sync.sh")
+    print(f"👉 系统状态检测: ./scripts/status.sh")
+    print(f"👉 手动即时同步: ./scripts/manual-sync.sh")
+    print(f"👉 查看实时日志: docker compose logs -f rclone-sync")
     print("=" * 60)
 
 if __name__ == '__main__':

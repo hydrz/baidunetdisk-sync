@@ -11,6 +11,17 @@ services:
       - OPENLIST_ADMIN_PASSWORD=${OPENLIST_ADMIN_PASSWORD:-admin123}
     volumes:
       - ./data/openlist:/opt/openlist/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:5244/api/public/settings || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - sync-net
 
@@ -19,7 +30,8 @@ services:
     container_name: baidunetdisk-rclone-sync
     restart: unless-stopped
     depends_on:
-      - openlist
+      openlist:
+        condition: service_healthy
     user: "${UID:-1000}:${GID:-1000}"
     environment:
       - TZ=Asia/Shanghai
@@ -34,8 +46,13 @@ services:
     volumes:
       - "${LOCAL_SYNC_DIR:-~/.baidunetdisk}:/data/local"
       - ./data/rclone:/config/rclone
-      - ./scripts/sync-daemon.sh:/scripts/sync-daemon.sh:ro
+      - ./scripts:/scripts:ro
     entrypoint: ["/bin/sh", "/scripts/sync-daemon.sh"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - sync-net
 
