@@ -23,6 +23,8 @@ services:
     user: "${UID:-1000}:${GID:-1000}"
     environment:
       - TZ=Asia/Shanghai
+      - HOME=/config/rclone
+      - RCLONE_CACHE_DIR=/config/rclone/.cache
       - SYNC_INTERVAL=${SYNC_INTERVAL:-300}
       - WEBDAV_USER=${WEBDAV_USER:-admin}
       - WEBDAV_PASSWORD=${WEBDAV_PASSWORD:-admin123}

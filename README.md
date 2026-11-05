@@ -41,6 +41,8 @@ flowchart LR
 ```bash
 python3 scripts/setup.py
 ```
+> [!NOTE]
+> OpenList v4.1.0+ 容器以非 root 用户 `openlist` (UID: 1001) 运行。脚本会自动初始化 `./data` 目录并赋予相应权限；如直接运行 `docker compose up`，需先执行 `chmod -R 777 ./data`。
 脚本将全自动完成：
 1. 从官方客户端 Cookies 中提取 `BDUSS`。
 2. 生成 `.env` 配置并创建本地 `~/.baidunetdisk` 目录。

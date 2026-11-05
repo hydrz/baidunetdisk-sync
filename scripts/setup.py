@@ -186,6 +186,15 @@ def main():
     admin_pwd = env.get('OPENLIST_ADMIN_PASSWORD', 'admin123')
     workspace_path = env.get('WEBDAV_WORKSPACE_PATH', 'workspace')
 
+    # 确保宿主机持久化目录存在并赋予读写权限（OpenList v4.1.0+ 内部使用 UID 1001 运行）
+    for d in ['data/openlist', 'data/rclone']:
+        dir_path = os.path.join(PROJECT_DIR, d)
+        os.makedirs(dir_path, exist_ok=True)
+        try:
+            os.chmod(dir_path, 0o777)
+        except Exception:
+            pass
+
     print("\n[+] 正在启动 OpenList 容器...")
     subprocess.run(["docker", "compose", "up", "-d", "openlist"], check=True)
 

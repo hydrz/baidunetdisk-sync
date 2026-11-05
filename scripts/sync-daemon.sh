@@ -1,9 +1,12 @@
 #!/bin/sh
 set -e
 
+export HOME=/config/rclone
+export RCLONE_CACHE_DIR=/config/rclone/.cache
+
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] 启动 Rclone 百度网盘同步空间守护进程..."
 
-mkdir -p /config/rclone /data/local
+mkdir -p /config/rclone /config/rclone/.cache /data/local
 
 # 等待 OpenList WebDAV 服务就绪
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] 正在检测 OpenList WebDAV (${WEBDAV_URL}) 连通性..."
