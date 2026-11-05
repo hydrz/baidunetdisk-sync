@@ -1,0 +1,42 @@
+services:
+  openlist:
+    image: openlistteam/openlist:latest
+    container_name: openlist-server
+    restart: unless-stopped
+    ports:
+      - "${OPENLIST_PORT:-5244}:5244"
+    environment:
+      - TZ=Asia/Shanghai
+      - UMASK=022
+      - OPENLIST_ADMIN_PASSWORD=${OPENLIST_ADMIN_PASSWORD:-admin123}
+    volumes:
+      - ./data/openlist:/opt/openlist/data
+    networks:
+      - sync-net
+
+  rclone-sync:
+    image: rclone/rclone:latest
+    container_name: baidunetdisk-rclone-sync
+    restart: unless-stopped
+    depends_on:
+      - openlist
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      - TZ=Asia/Shanghai
+      - SYNC_INTERVAL=${SYNC_INTERVAL:-300}
+      - WEBDAV_USER=${WEBDAV_USER:-admin}
+      - WEBDAV_PASSWORD=${WEBDAV_PASSWORD:-admin123}
+      - WEBDAV_URL=http://openlist:5244/dav
+      - WEBDAV_WORKSPACE_PATH=${WEBDAV_WORKSPACE_PATH:-workspace}
+      - RESYNC_ON_START=${RESYNC_ON_START:-false}
+    volumes:
+      - "${LOCAL_SYNC_DIR:-/home/nan/.baidunetdisk}:/data/local"
+      - ./data/rclone:/config/rclone
+      - ./scripts/sync-daemon.sh:/scripts/sync-daemon.sh:ro
+    entrypoint: ["/bin/sh", "/scripts/sync-daemon.sh"]
+    networks:
+      - sync-net
+
+networks:
+  sync-net:
+    driver: bridge
