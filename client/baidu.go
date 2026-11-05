@@ -57,7 +57,16 @@ func NewBaiduClient(accessToken, refreshToken string, onTokenRenew TokenUpdateCa
 		accessToken:  accessToken,
 		refreshToken: refreshToken,
 		httpClient: &http.Client{
-			Timeout: 10 * time.Minute,
+			// 不设置整体 Timeout，避免大文件传输被强行中断；改用连接/响应头级别超时
+			Transport: &http.Transport{
+				Proxy:                 http.ProxyFromEnvironment,
+				MaxIdleConns:          128,
+				MaxIdleConnsPerHost:   64,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   15 * time.Second,
+				ResponseHeaderTimeout: 2 * time.Minute,
+				ForceAttemptHTTP2:     true,
+			},
 		},
 		onTokenRenew: onTokenRenew,
 	}
@@ -415,46 +424,48 @@ func (c *BaiduClient) downloadFileOnce(remotePath, localTarget string, expectedS
 	return nil
 }
 
-// UploadFile 通过 PCS 专属接口上传文件，支持重试
-func (c *BaiduClient) UploadFile(localPath, remotePath string) error {
+// UploadFile 通过 PCS 专属接口流式上传文件（不占用大内存），返回远端 mtime，支持重试
+func (c *BaiduClient) UploadFile(localPath, remotePath string) (int64, error) {
 	var lastErr error
 	for attempt := 1; attempt <= 3; attempt++ {
-		lastErr = c.uploadFileOnce(localPath, remotePath)
+		var mtime int64
+		mtime, lastErr = c.uploadFileOnce(localPath, remotePath)
 		if lastErr == nil {
-			return nil
+			return mtime, nil
 		}
 		log.Printf("[重试] 上传 %s 第 %d 次失败: %v, 稍候重试...", filepath.Base(localPath), attempt, lastErr)
 		time.Sleep(time.Duration(attempt) * time.Second)
 	}
-	return lastErr
+	return 0, lastErr
 }
 
-func (c *BaiduClient) uploadFileOnce(localPath, remotePath string) error {
+func (c *BaiduClient) uploadFileOnce(localPath, remotePath string) (int64, error) {
 	token := c.GetAccessToken()
 	if token == "" {
 		if err := c.RefreshToken(); err != nil {
-			return err
+			return 0, err
 		}
 		token = c.GetAccessToken()
 	}
 
 	f, err := os.Open(localPath)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer f.Close()
 
-	bodyBuf := &bytes.Buffer{}
-	writer := multipart.NewWriter(bodyBuf)
-	part, err := writer.CreateFormFile("file", filepath.Base(localPath))
-	if err != nil {
-		return err
-	}
-
-	if _, err := io.Copy(part, f); err != nil {
-		return err
-	}
-	writer.Close()
+	pr, pw := io.Pipe()
+	writer := multipart.NewWriter(pw)
+	go func() {
+		part, err := writer.CreateFormFile("file", filepath.Base(localPath))
+		if err == nil {
+			_, err = io.Copy(part, f)
+		}
+		if err == nil {
+			err = writer.Close()
+		}
+		pw.CloseWithError(err)
+	}()
 
 	reqURL := fmt.Sprintf(
 		"https://d.pcs.baidu.com/rest/2.0/pcs/file?method=upload&path=%s&access_token=%s&ondup=overwrite&app_id=250528",
@@ -462,18 +473,22 @@ func (c *BaiduClient) uploadFileOnce(localPath, remotePath string) error {
 		url.QueryEscape(token),
 	)
 
-	req, err := http.NewRequest("POST", reqURL, bodyBuf)
+	req, err := http.NewRequest("POST", reqURL, pr)
 	if err != nil {
-		return err
+		pr.Close()
+		return 0, err
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	req.Header.Set("User-Agent", "pan.baidu.com")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("上传网络请求失败: %w", err)
+		pr.Close()
+		return 0, fmt.Errorf("上传网络请求失败: %w", err)
 	}
 	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		if err := c.RefreshToken(); err == nil {
@@ -482,11 +497,17 @@ func (c *BaiduClient) uploadFileOnce(localPath, remotePath string) error {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("上传失败 HTTP %d: %s", resp.StatusCode, string(body))
+		return 0, fmt.Errorf("上传失败 HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
-	return nil
+	var res struct {
+		Mtime int64 `json:"mtime"`
+	}
+	_ = json.Unmarshal(body, &res)
+	if res.Mtime == 0 {
+		res.Mtime = time.Now().Unix()
+	}
+	return res.Mtime, nil
 }
 
 // DeleteFile 在百度网盘中删除文件或文件夹

@@ -18,7 +18,7 @@ var (
 	flagSync     = flag.Bool("sync", false, "执行单次同步后退出")
 	flagDaemon   = flag.Bool("daemon", false, "持续常驻后台周期性自动同步")
 	flagInterval = flag.Int("interval", 0, "后台常驻模式下的同步间隔时间（秒）")
-	flagWorkers  = flag.Int("workers", 0, "并发下载/上传工作线程数 (默认 4)")
+	flagWorkers  = flag.Int("workers", 0, "并发下载/上传工作线程数 (默认 16)")
 	flagDryRun   = flag.Bool("dry-run", false, "演练模式（仅分析打印待执行的操作，不实际变动文件）")
 	flagDir      = flag.String("dir", "", "自定义本地同步目录路径（默认 ~/.baidunetdisk）")
 	flagRemote   = flag.String("remote", "", "自定义百度网盘同步根目录（默认 /_pcs_.workspace）")

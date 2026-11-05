@@ -306,7 +306,7 @@ func (e *Engine) Sync() error {
 	// 并发执行任务队列
 	concurrency := e.cfg.Concurrency
 	if concurrency <= 0 {
-		concurrency = 4
+		concurrency = 16
 	}
 	taskChan := make(chan SyncTask, len(tasks))
 	for _, t := range tasks {
@@ -378,6 +378,9 @@ func (e *Engine) executeTask(task SyncTask) (int64, error) {
 		if err := e.client.DownloadFile(remoteFullPath, localFullPath, expected); err != nil {
 			return 0, err
 		}
+		if task.Remote != nil && task.Remote.ServerMtime > 0 {
+			_ = os.Chtimes(localFullPath, time.Now(), time.Unix(task.Remote.ServerMtime, 0))
+		}
 		info, err := os.Stat(localFullPath)
 		if err == nil {
 			e.state.Update(task.RelPath, info.Size(), info.ModTime().Unix(), task.Remote.Size, task.Remote.ServerMtime)
@@ -387,12 +390,14 @@ func (e *Engine) executeTask(task SyncTask) (int64, error) {
 		if task.Local != nil {
 			transferredSize = task.Local.Size
 		}
-		if err := e.client.UploadFile(localFullPath, remoteFullPath); err != nil {
+		remoteMtime, err := e.client.UploadFile(localFullPath, remoteFullPath)
+		if err != nil {
 			return 0, err
 		}
 		info, err := os.Stat(localFullPath)
 		if err == nil {
-			e.state.Update(task.RelPath, info.Size(), info.ModTime().Unix(), info.Size(), time.Now().Unix())
+			// 使用服务端返回的真实 mtime，避免下轮被误判为远端已修改
+			e.state.Update(task.RelPath, info.Size(), info.ModTime().Unix(), info.Size(), remoteMtime)
 		}
 
 	case ActionDeleteL:
@@ -423,6 +428,9 @@ func (e *Engine) executeTask(task SyncTask) (int64, error) {
 		}
 		if err := e.client.DownloadFile(remoteFullPath, localFullPath, expected); err != nil {
 			return 0, err
+		}
+		if task.Remote != nil && task.Remote.ServerMtime > 0 {
+			_ = os.Chtimes(localFullPath, time.Now(), time.Unix(task.Remote.ServerMtime, 0))
 		}
 		info, err := os.Stat(localFullPath)
 		if err == nil {

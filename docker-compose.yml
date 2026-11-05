@@ -15,7 +15,7 @@ services:
       - LOCAL_SYNC_DIR=/data
       - REMOTE_ROOT=${REMOTE_ROOT:-/_pcs_.workspace}
       - SYNC_INTERVAL=${SYNC_INTERVAL:-300}
-      - CONCURRENCY=${CONCURRENCY:-4}
+      - CONCURRENCY=${CONCURRENCY:-16}
       - BAIDU_ACCESS_TOKEN=${BAIDU_ACCESS_TOKEN}
       - BAIDU_REFRESH_TOKEN=${BAIDU_REFRESH_TOKEN}
       - TZ=Asia/Shanghai

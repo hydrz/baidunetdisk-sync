@@ -70,9 +70,9 @@ func LoadConfig() (*Config, error) {
 		interval = 300
 	}
 
-	concurrency, _ := strconv.Atoi(getVal("CONCURRENCY", "4"))
+	concurrency, _ := strconv.Atoi(getVal("CONCURRENCY", "16"))
 	if concurrency <= 0 {
-		concurrency = 4
+		concurrency = 16
 	}
 
 	return &Config{
