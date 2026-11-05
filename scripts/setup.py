@@ -40,9 +40,6 @@ def init_env(bduss):
     env_file = os.path.join(PROJECT_DIR, '.env')
     example_file = os.path.join(PROJECT_DIR, '.env.example')
     
-    # 默认值
-    user_home = os.path.expanduser('~')
-    sync_dir = os.path.join(user_home, '.baidunetdisk')
     uid = os.getuid()
     gid = os.getgid()
     
@@ -54,7 +51,6 @@ def init_env(bduss):
         print("[+] 生成 .env 文件...")
         with open(example_file, 'r', encoding='utf-8') as f:
             content = f.read()
-        content = content.replace('/home/nan/.baidunetdisk', sync_dir)
         content += f"\nUID={uid}\nGID={gid}\n"
     
     if bduss and 'BAIDU_BDUSS=' in content:
@@ -69,6 +65,7 @@ def init_env(bduss):
     with open(env_file, 'w', encoding='utf-8') as f:
         f.write(content)
 
+    sync_dir = os.path.expanduser('~/.baidunetdisk')
     os.makedirs(sync_dir, exist_ok=True)
     print(f"[+] 本地同步目录已就绪: {sync_dir}")
     return env_file

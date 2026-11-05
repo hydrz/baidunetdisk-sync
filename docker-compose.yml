@@ -30,7 +30,7 @@ services:
       - WEBDAV_WORKSPACE_PATH=${WEBDAV_WORKSPACE_PATH:-workspace}
       - RESYNC_ON_START=${RESYNC_ON_START:-false}
     volumes:
-      - "${LOCAL_SYNC_DIR:-/home/nan/.baidunetdisk}:/data/local"
+      - "${LOCAL_SYNC_DIR:-~/.baidunetdisk}:/data/local"
       - ./data/rclone:/config/rclone
       - ./scripts/sync-daemon.sh:/scripts/sync-daemon.sh:ro
     entrypoint: ["/bin/sh", "/scripts/sync-daemon.sh"]
