@@ -1,13 +1,12 @@
 # 敏感环境变量配置
 .env
 
-# OpenList 本地持久化数据库与缓存
-data/openlist/
-data/rclone/
+# 编译生成物
+baidunetdisk-sync
 
-# Python 缓存
-__pycache__/
-*.pyc
+# 临时文件与状态
+*.tmp
+*.bdsync.tmp
 
 # 系统文件
 .DS_Store

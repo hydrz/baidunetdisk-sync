@@ -1,61 +1,21 @@
 services:
-  openlist:
-    image: openlistteam/openlist:latest
-    container_name: openlist-server
+  baidunetdisk-sync:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: baidunetdisk-sync:latest
+    container_name: baidunetdisk-sync
     restart: unless-stopped
-    ports:
-      - "${OPENLIST_PORT:-5244}:5244"
-    environment:
-      - TZ=Asia/Shanghai
-      - UMASK=022
-      - OPENLIST_ADMIN_PASSWORD=${OPENLIST_ADMIN_PASSWORD:-admin123}
     volumes:
-      - ./data/openlist:/opt/openlist/data
-    healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:5244/api/public/settings || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 5s
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    networks:
-      - sync-net
-
-  rclone-sync:
-    image: rclone/rclone:latest
-    container_name: baidunetdisk-rclone-sync
-    restart: unless-stopped
-    depends_on:
-      openlist:
-        condition: service_healthy
-    user: "${UID:-1000}:${GID:-1000}"
+      # 挂载本地同步目录到容器内的 /data
+      - ${LOCAL_SYNC_DIR:-/home/nan/.baidunetdisk}:/data
+      # 挂载 .env 文件以便更新 Token 时持久化保存
+      - ./.env:/app/.env
     environment:
-      - TZ=Asia/Shanghai
-      - HOME=/config/rclone
-      - RCLONE_CACHE_DIR=/config/rclone/.cache
+      - LOCAL_SYNC_DIR=/data
+      - REMOTE_ROOT=${REMOTE_ROOT:-/_pcs_.workspace}
       - SYNC_INTERVAL=${SYNC_INTERVAL:-300}
-      - WEBDAV_USER=${WEBDAV_USER:-admin}
-      - WEBDAV_PASSWORD=${WEBDAV_PASSWORD:-admin123}
-      - WEBDAV_URL=http://openlist:5244/dav
-      - WEBDAV_WORKSPACE_PATH=${WEBDAV_WORKSPACE_PATH:-workspace}
-      - RESYNC_ON_START=${RESYNC_ON_START:-false}
-    volumes:
-      - "${LOCAL_SYNC_DIR:-~/.baidunetdisk}:/data/local"
-      - ./data/rclone:/config/rclone
-      - ./scripts:/scripts:ro
-    entrypoint: ["/bin/sh", "/scripts/sync-daemon.sh"]
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    networks:
-      - sync-net
-
-networks:
-  sync-net:
-    driver: bridge
+      - CONCURRENCY=${CONCURRENCY:-4}
+      - BAIDU_ACCESS_TOKEN=${BAIDU_ACCESS_TOKEN}
+      - BAIDU_REFRESH_TOKEN=${BAIDU_REFRESH_TOKEN}
+      - TZ=Asia/Shanghai

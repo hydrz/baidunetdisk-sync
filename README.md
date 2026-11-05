@@ -1,6 +1,6 @@
-# 百度网盘 Linux 双向离线同步系统 (OpenList + Rclone)
+# 百度网盘 Linux 双向离线同步系统 (Go 原生容器版)
 
-专为 Linux 环境打造的百度网盘“同步空间 (Sync Space)”双向离线同步套件。
+专为 Linux 环境打造的百度网盘“同步空间 (Sync Space / `/_pcs_.workspace`)”双向离线增量同步套件。
 
 ```mermaid
 flowchart LR
@@ -8,63 +8,79 @@ flowchart LR
         Baidu["百度网盘云端<br/>(/_pcs_.workspace 同步空间)"]
     end
 
-    subgraph Docker 本地容器层
-        OpenList["OpenList 服务端<br/>(挂载同步空间转 WebDAV)"]
-        Rclone["Rclone 守护容器<br/>(定时双向增量同步引擎)"]
+    subgraph Docker 本地容器
+        App["baidunetdisk-sync (Go 原生)<br/>• PCS 直链流式传输<br/>• 自动 Token 续期<br/>• 冲突保护与状态追踪"]
     end
 
     subgraph 宿主机文件系统
         LocalDir["本地同步文件夹<br/>(~/.baidunetdisk)"]
+        EnvFile[".env 配置文件"]
     end
 
-    Baidu <-->|百度官方 PCS 接口| OpenList
-    OpenList <-->|WebDAV 协议| Rclone
-    Rclone <-->|双向冲突仲裁与增量同步| LocalDir
+    Baidu <-->|百度原生 PCS API| App
+    App <-->|双向增量同步| LocalDir
+    App -.->|Token 自动刷新写回| EnvFile
 ```
 
 ---
 
-## 🌟 特性
+## 🌟 核心优势
 
-- **精准对接同步空间**：直连百度网盘私有同步空间根路径 `/_pcs_.workspace`。
-- **纯官方 OAuth 授权**：无需提取任何 Cookie 或本地客户端凭证，通过官方 Refresh Token 安全鉴权。
-- **真正的双向增量同步**：基于 `rclone bisync`，支持双端修改同步、删除同步与冲突保护。
-- **状态不丢失**：工作区元数据与对比快照持久化保存在本地挂载卷，容器重启无需重新 `--resync`。
-- **全自动化运维**：集成一键配置脚本、过滤规则、即时手动同步与系统健康状态监测。
-- **垃圾文件过滤**：内置 `scripts/filter.txt`，自动忽略 `.git/`、临时文件 `~$*`、缓存与 `.DS_Store`。
+- **直连百度网盘同步空间**：直连百度私有同步空间根路径 `/_pcs_.workspace`，避开 OpenList 的 `/api/filemetas` errno 9019 限制与 Rclone 缓存权限问题。
+- **免中间层纯原生实现**：采用单二进制 Golang 打造，内存占用 < 20MB，启动秒级响应，无需额外 WebDAV 中转。
+- **Token 自动续期与持久化**：借用 `https://api.oplist.org/` 授权接口，支持自动凭证续期并将新 Token 写回 `.env`，彻底解决 Token 过期停摆问题。
+- **真正的双向增量同步**：精准感知本地与云端的添加、修改与删除；发生双端修改时自动备份冲突版本（`.conflict-时间戳`），保护数据安全。
+- **Docker Compose 一键管理**：支持后台常驻、一键启停、日志追踪与即时手动同步。
 
 ---
 
 ## 🚀 快速上手
 
 ### 1. 获取授权 Token
-访问 OpenList 官方授权页面获取令牌：
+访问官方授权页面获取令牌：
 👉 **https://api.oplist.org/**
 - 选择 **百度网盘**，点击授权登录并复制生成的 **Refresh Token**。
 
-### 2. 一键初始化与启动
-在项目根目录下执行：
+### 2. 配置环境变量
+复制并编辑 `.env` 文件：
 ```bash
-python3 scripts/setup.py
+cp .env.example .env
 ```
-根据提示粘贴获取到的 Refresh Token，脚本将全自动完成：
-- 自动生成 `.env` 并修复宿主机数据目录权限。
-- 启动 OpenList 容器并通过 REST API 自动挂载 `/_pcs_.workspace`。
-- 启动 Rclone 守护容器执行初次对齐并进入后台轮询。
+将获取到的 Refresh Token 填入 `BAIDU_REFRESH_TOKEN`：
+```ini
+LOCAL_SYNC_DIR=/home/nan/.baidunetdisk
+REMOTE_ROOT=/_pcs_.workspace
+SYNC_INTERVAL=300
+CONCURRENCY=4
+BAIDU_REFRESH_TOKEN="你的_refresh_token"
+```
+
+### 3. 使用 Docker Compose 启动
+
+```bash
+# 构建并后台启动同步服务
+docker compose up -d
+
+# 查看实时同步日志
+docker compose logs -f
+
+# 停止同步服务
+docker compose down
+```
 
 ---
 
-## 🛠️ 运维与日常使用
+## 🛠️ 常用运维指令
 
 | 需求 | 命令 |
 | :--- | :--- |
-| **一键检查系统状态** | `./scripts/status.sh` |
-| **即时手动双向同步** | `./scripts/manual-sync.sh` |
-| **仅预览变动（不实际改动）** | `./scripts/manual-sync.sh --dry-run` |
-| **强制重新基准校准** | `./scripts/manual-sync.sh --resync` |
-| **查看实时同步日志** | `docker compose logs -f rclone-sync` |
+| **启动后台同步服务** | `docker compose up -d` |
+| **查看实时同步日志** | `docker compose logs -f` |
 | **停止服务** | `docker compose down` |
-| **启动服务** | `docker compose up -d` |
+| **执行单次即时同步** | `docker compose run --rm baidunetdisk-sync -sync` |
+| **演练模式（仅分析不改动）** | `docker compose run --rm baidunetdisk-sync -dry-run` |
+| **检查状态概览** | `docker compose run --rm baidunetdisk-sync -status` |
+| **重新构建容器镜像** | `docker compose build` |
 
 ---
 
@@ -72,28 +88,17 @@ python3 scripts/setup.py
 
 ```
 baidunetdisk-sync/
-├── docker-compose.yml       # 容器服务编排定义
+├── Dockerfile               # 容器构建文件 (Alpine 极简镜像)
+├── docker-compose.yml       # Docker Compose 服务编排定义
+├── .env                     # 本地配置文件 (Token 与路径)
 ├── .env.example             # 环境变量配置模板
-├── .gitignore
-├── README.md                # 完整技术与运维指南
-├── data/                    # 数据库与 Rclone 状态持久化目录（自动创建）
-└── scripts/
-    ├── setup.py             # 一键自动初始化安装流水线
-    ├── status.sh            # 容器与 WebDAV 状态检测脚本
-    ├── sync-daemon.sh       # Rclone 容器后台同步守护进程
-    ├── manual-sync.sh       # 手动即时同步脚本（支持 --dry-run）
-    └── filter.txt           # 同步排除过滤规则定义
-```
-
----
-
-## ⚙️ 关键配置参数 (`.env`)
-
-```ini
-LOCAL_SYNC_DIR=~/.baidunetdisk   # 本地同步文件夹路径
-OPENLIST_PORT=5244               # OpenList Web 访问端口
-OPENLIST_ADMIN_PASSWORD=admin123 # 管理员密码
-WEBDAV_WORKSPACE_PATH=workspace  # 挂载空间路径名
-SYNC_INTERVAL=300                # 双向自动同步轮询间隔（秒）
-BAIDU_REFRESH_TOKEN=""           # 百度网盘 Refresh Token
+├── client/
+│   └── baidu.go             # 百度 PCS API 直连与 Token 自动续期客户端
+├── syncer/
+│   ├── engine.go            # 双向同步对比与并发执行引擎
+│   ├── filter.go            # 忽略规则过滤器 (.git, .DS_Store, 临时文件等)
+│   └── state.go             # 本地与远端文件元数据持久化状态管理
+├── config/
+│   └── config.go            # 配置加载与 Token 持久化回写
+└── main.go                  # CLI 入口与守护进程
 ```
