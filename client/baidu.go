@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -26,6 +27,11 @@ type FileItem struct {
 }
 
 type listResponse struct {
+	Errno int        `json:"errno"`
+	List  []FileItem `json:"list"`
+}
+
+type listAllResponse struct {
 	Errno int        `json:"errno"`
 	List  []FileItem `json:"list"`
 }
@@ -118,7 +124,7 @@ func (c *BaiduClient) RefreshToken() error {
 		if errMsg == "" {
 			errMsg = string(body)
 		}
-		return fmt.Errorf("刷新 token 失败: %s，可能 refresh_token 已过期或无效，请重新在 https://api.oplist.org/ 获取", errMsg)
+		return fmt.Errorf("刷新 token 失败: %s，可能 refresh_token 已过期或无效", errMsg)
 	}
 
 	c.SetTokens(res.AccessToken, res.RefreshToken)
@@ -128,6 +134,78 @@ func (c *BaiduClient) RefreshToken() error {
 	}
 
 	return nil
+}
+
+// ListAllFast 利用官方 listall 递归接口，单次请求极速获取整棵树（数百倍性能提升）
+func (c *BaiduClient) ListAllFast(remoteRoot string) (map[string]FileItem, error) {
+	token := c.GetAccessToken()
+	if token == "" {
+		if err := c.RefreshToken(); err != nil {
+			return nil, err
+		}
+		token = c.GetAccessToken()
+	}
+
+	reqURL := fmt.Sprintf(
+		"https://pan.baidu.com/rest/2.0/xpan/file?method=listall&path=%s&access_token=%s&recursion=1&web=1",
+		url.QueryEscape(remoteRoot),
+		url.QueryEscape(token),
+	)
+
+	req, err := http.NewRequest("GET", reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "pan.baidu.com")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		if err := c.RefreshToken(); err == nil {
+			return c.ListAllFast(remoteRoot)
+		}
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	var lr listAllResponse
+	if err := json.NewDecoder(resp.Body).Decode(&lr); err != nil {
+		return nil, err
+	}
+
+	if lr.Errno == -6 || lr.Errno == 111 {
+		if err := c.RefreshToken(); err != nil {
+			return nil, err
+		}
+		return c.ListAllFast(remoteRoot)
+	}
+
+	if lr.Errno != 0 && lr.Errno != 12 { // errno 12 是空目录
+		return nil, fmt.Errorf("errno %d", lr.Errno)
+	}
+
+	result := make(map[string]FileItem, len(lr.List))
+	for _, item := range lr.List {
+		if item.IsDir == 1 {
+			continue
+		}
+		relPath := item.Path
+		if len(relPath) > len(remoteRoot) {
+			relPath = relPath[len(remoteRoot):]
+			if len(relPath) > 0 && relPath[0] == '/' {
+				relPath = relPath[1:]
+			}
+		}
+		result[relPath] = item
+	}
+
+	return result, nil
 }
 
 // ListDir 列出指定目录下的文件与子文件夹
@@ -180,11 +258,9 @@ func (c *BaiduClient) ListDir(remoteDir string) ([]FileItem, error) {
 		}
 
 		if lr.Errno == -6 || lr.Errno == 111 {
-			// Token 失效，尝试刷新一次
 			if err := c.RefreshToken(); err != nil {
 				return nil, fmt.Errorf("Token 失效且刷新失败: %w", err)
 			}
-			// 重试当前页
 			continue
 		}
 
@@ -202,8 +278,17 @@ func (c *BaiduClient) ListDir(remoteDir string) ([]FileItem, error) {
 	return allItems, nil
 }
 
-// ListRecursive 深度递归扫描远程文件树
+// ListRecursive 深度扫描远端文件树（优先极速 listall，失败自动降级为 BFS 逐层扫描）
 func (c *BaiduClient) ListRecursive(remoteRoot string, onProgress func(dirsScanned, filesFound int)) (map[string]FileItem, error) {
+	log.Println("[扫描优化] 正在尝试调用百度网盘 listall 全量极速索引接口...")
+	fastStart := time.Now()
+	items, err := c.ListAllFast(remoteRoot)
+	if err == nil {
+		log.Printf("[扫描优化] 极速索引成功！耗时: %v，直接秒级获取 %d 个文件", time.Since(fastStart).Round(time.Millisecond), len(items))
+		return items, nil
+	}
+
+	log.Printf("[扫描] 极速索引不可用 (%v)，平滑降级为常规逐级深度遍历...", err)
 	result := make(map[string]FileItem)
 	dirQueue := []string{remoteRoot}
 	dirsScanned := 0
@@ -241,8 +326,21 @@ func (c *BaiduClient) ListRecursive(remoteRoot string, onProgress func(dirsScann
 	return result, nil
 }
 
-// DownloadFile 通过 PCS 专属直链流式下载文件（带原子替换）
-func (c *BaiduClient) DownloadFile(remotePath, localTarget string) error {
+// DownloadFile 通过 PCS 接口流式下载，支持断点续传与失败自动重试
+func (c *BaiduClient) DownloadFile(remotePath, localTarget string, expectedSize int64) error {
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		lastErr = c.downloadFileOnce(remotePath, localTarget, expectedSize)
+		if lastErr == nil {
+			return nil
+		}
+		log.Printf("[重试] 下载 %s 第 %d 次失败: %v, 稍候重试...", filepath.Base(localTarget), attempt, lastErr)
+		time.Sleep(time.Duration(attempt) * time.Second)
+	}
+	return lastErr
+}
+
+func (c *BaiduClient) downloadFileOnce(remotePath, localTarget string, expectedSize int64) error {
 	token := c.GetAccessToken()
 	if token == "" {
 		if err := c.RefreshToken(); err != nil {
@@ -263,6 +361,17 @@ func (c *BaiduClient) DownloadFile(remotePath, localTarget string) error {
 	}
 	req.Header.Set("User-Agent", "pan.baidu.com")
 
+	if err := os.MkdirAll(filepath.Dir(localTarget), 0755); err != nil {
+		return err
+	}
+
+	tmpTarget := localTarget + ".bdsync.tmp"
+	var existingSize int64 = 0
+	if fi, err := os.Stat(tmpTarget); err == nil && expectedSize > 0 && fi.Size() < expectedSize {
+		existingSize = fi.Size()
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", existingSize))
+	}
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("下载网络请求失败: %w", err)
@@ -271,21 +380,22 @@ func (c *BaiduClient) DownloadFile(remotePath, localTarget string) error {
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		if err := c.RefreshToken(); err == nil {
-			return c.DownloadFile(remotePath, localTarget)
+			return c.downloadFileOnce(remotePath, localTarget, expectedSize)
 		}
 	}
 
-	if resp.StatusCode != http.StatusOK {
+	var out *os.File
+	if resp.StatusCode == http.StatusPartialContent && existingSize > 0 {
+		// 断点追加写入
+		out, err = os.OpenFile(tmpTarget, os.O_WRONLY|os.O_APPEND, 0644)
+	} else if resp.StatusCode == http.StatusOK {
+		// 全量重新写入
+		out, err = os.Create(tmpTarget)
+	} else {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("下载失败 HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
-	if err := os.MkdirAll(filepath.Dir(localTarget), 0755); err != nil {
-		return err
-	}
-
-	tmpTarget := localTarget + ".bdsync.tmp"
-	out, err := os.Create(tmpTarget)
 	if err != nil {
 		return err
 	}
@@ -293,21 +403,33 @@ func (c *BaiduClient) DownloadFile(remotePath, localTarget string) error {
 	_, err = io.Copy(out, resp.Body)
 	out.Close()
 	if err != nil {
-		os.Remove(tmpTarget)
 		return fmt.Errorf("写入文件中断: %w", err)
 	}
 
 	// 原子替换
 	if err := os.Rename(tmpTarget, localTarget); err != nil {
-		os.Remove(localTarget)
+		_ = os.Remove(localTarget)
 		return os.Rename(tmpTarget, localTarget)
 	}
 
 	return nil
 }
 
-// UploadFile 通过 PCS 专属接口上传文件到同步空间
+// UploadFile 通过 PCS 专属接口上传文件，支持重试
 func (c *BaiduClient) UploadFile(localPath, remotePath string) error {
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		lastErr = c.uploadFileOnce(localPath, remotePath)
+		if lastErr == nil {
+			return nil
+		}
+		log.Printf("[重试] 上传 %s 第 %d 次失败: %v, 稍候重试...", filepath.Base(localPath), attempt, lastErr)
+		time.Sleep(time.Duration(attempt) * time.Second)
+	}
+	return lastErr
+}
+
+func (c *BaiduClient) uploadFileOnce(localPath, remotePath string) error {
 	token := c.GetAccessToken()
 	if token == "" {
 		if err := c.RefreshToken(); err != nil {
@@ -355,7 +477,7 @@ func (c *BaiduClient) UploadFile(localPath, remotePath string) error {
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		if err := c.RefreshToken(); err == nil {
-			return c.UploadFile(localPath, remotePath)
+			return c.uploadFileOnce(localPath, remotePath)
 		}
 	}
 

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hydrz/baidunetdisk-sync/client"
@@ -32,11 +33,11 @@ const (
 )
 
 type SyncTask struct {
-	Type     SyncActionType
-	RelPath  string
-	Local    *LocalFile
-	Remote   *client.FileItem
-	Reason   string
+	Type    SyncActionType
+	RelPath string
+	Local   *LocalFile
+	Remote  *client.FileItem
+	Reason  string
 }
 
 type Engine struct {
@@ -253,23 +254,23 @@ func (e *Engine) Plan(localMap map[string]LocalFile, remoteMap map[string]client
 
 // Sync 执行一次完整的双向同步循环
 func (e *Engine) Sync() error {
-	log.Printf("[扫描] 正在扫描本地目录: %s ...", e.cfg.LocalSyncDir)
+	log.Printf("[本地扫描] 正在扫描: %s ...", e.cfg.LocalSyncDir)
 	localFiles, err := e.ScanLocal()
 	if err != nil {
 		return fmt.Errorf("扫描本地目录失败: %w", err)
 	}
 	log.Printf("[本地] 发现 %d 个有效文件", len(localFiles))
 
-	log.Printf("[扫描] 正在扫描百度网盘同步空间: %s ...", e.cfg.RemoteRoot)
+	log.Printf("[远端扫描] 正在扫描百度网盘同步空间: %s ...", e.cfg.RemoteRoot)
 	remoteFiles, err := e.client.ListRecursive(e.cfg.RemoteRoot, func(dirsScanned, filesFound int) {
-		if dirsScanned%10 == 0 || filesFound%100 == 0 {
-			log.Printf("[远端扫描] 已扫描 %d 个目录，发现 %d 个文件...", dirsScanned, filesFound)
+		if dirsScanned%20 == 0 || filesFound%200 == 0 {
+			log.Printf("[远端扫描进度] 已扫描 %d 个目录，发现 %d 个文件...", dirsScanned, filesFound)
 		}
 	})
 	if err != nil {
 		return fmt.Errorf("扫描百度网盘失败: %w", err)
 	}
-	log.Printf("[远端] 发现 %d 个文件", len(remoteFiles))
+	log.Printf("[远端] 扫描完成，共索引 %d 个文件", len(remoteFiles))
 
 	tasks := e.Plan(localFiles, remoteFiles)
 	if len(tasks) == 0 {
@@ -277,14 +278,24 @@ func (e *Engine) Sync() error {
 		return nil
 	}
 
-	log.Printf("[计划] 发现 %d 个待同步任务:", len(tasks))
+	// 统计任务大小
+	var totalBytes int64
+	for _, t := range tasks {
+		if t.Remote != nil && t.Remote.Size > 0 {
+			totalBytes += t.Remote.Size
+		} else if t.Local != nil && t.Local.Size > 0 {
+			totalBytes += t.Local.Size
+		}
+	}
+
+	log.Printf("[计划] 发现 %d 项待处理任务 (传输预估: %s):", len(tasks), FormatBytes(totalBytes))
 	for i, task := range tasks {
-		if i < 20 {
+		if i < 15 {
 			log.Printf("  [%s] %s (%s)", task.Type, task.RelPath, task.Reason)
 		}
 	}
-	if len(tasks) > 20 {
-		log.Printf("  ... 以及其他 %d 项任务", len(tasks)-20)
+	if len(tasks) > 15 {
+		log.Printf("  ... 以及其他 %d 项任务", len(tasks)-15)
 	}
 
 	if e.cfg.DryRun {
@@ -304,21 +315,36 @@ func (e *Engine) Sync() error {
 	close(taskChan)
 
 	var wg sync.WaitGroup
-	var errMu sync.Mutex
-	var errCount int
+	var errCount int64
+	var completedCount int64
+	totalTasks := int64(len(tasks))
 
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
 			for task := range taskChan {
-				if err := e.executeTask(task); err != nil {
-					log.Printf("[ERROR] [%s] %s 失败: %v", task.Type, task.RelPath, err)
-					errMu.Lock()
-					errCount++
-					errMu.Unlock()
+				taskStart := time.Now()
+				fileSize, err := e.executeTask(task)
+				idx := atomic.AddInt64(&completedCount, 1)
+
+				if err != nil {
+					log.Printf("[ERROR] [%d/%d] [%s] %s 失败: %v", idx, totalTasks, task.Type, task.RelPath, err)
+					atomic.AddInt64(&errCount, 1)
 				} else {
-					log.Printf("[SUCCESS] [%s] %s 完成", task.Type, task.RelPath)
+					dur := time.Since(taskStart)
+					speedStr := ""
+					if fileSize > 0 && dur.Seconds() > 0.05 {
+						speed := float64(fileSize) / dur.Seconds()
+						speedStr = fmt.Sprintf(" (%s/s)", FormatBytes(int64(speed)))
+					}
+					log.Printf("[SUCCESS] [%d/%d] [%s] %s (%s, 耗时 %v%s)",
+						idx, totalTasks, task.Type, task.RelPath, FormatBytes(fileSize), dur.Round(time.Millisecond), speedStr)
+
+					// 每完成 20 个任务自动持久化一次状态，防止意外中断
+					if idx%20 == 0 {
+						_ = e.state.Save()
+					}
 				}
 			}
 		}(i + 1)
@@ -336,14 +362,21 @@ func (e *Engine) Sync() error {
 	return nil
 }
 
-func (e *Engine) executeTask(task SyncTask) error {
+func (e *Engine) executeTask(task SyncTask) (int64, error) {
 	remoteFullPath := filepath.ToSlash(filepath.Join(e.cfg.RemoteRoot, task.RelPath))
 	localFullPath := filepath.Join(e.cfg.LocalSyncDir, filepath.FromSlash(task.RelPath))
 
+	var transferredSize int64
+
 	switch task.Type {
 	case ActionDownload:
-		if err := e.client.DownloadFile(remoteFullPath, localFullPath); err != nil {
-			return err
+		var expected int64
+		if task.Remote != nil {
+			expected = task.Remote.Size
+			transferredSize = expected
+		}
+		if err := e.client.DownloadFile(remoteFullPath, localFullPath, expected); err != nil {
+			return 0, err
 		}
 		info, err := os.Stat(localFullPath)
 		if err == nil {
@@ -351,29 +384,30 @@ func (e *Engine) executeTask(task SyncTask) error {
 		}
 
 	case ActionUpload:
+		if task.Local != nil {
+			transferredSize = task.Local.Size
+		}
 		if err := e.client.UploadFile(localFullPath, remoteFullPath); err != nil {
-			return err
+			return 0, err
 		}
 		info, err := os.Stat(localFullPath)
 		if err == nil {
-			// 上传后使用当前本地时间记录远端时间戳
 			e.state.Update(task.RelPath, info.Size(), info.ModTime().Unix(), info.Size(), time.Now().Unix())
 		}
 
 	case ActionDeleteL:
 		if err := os.Remove(localFullPath); err != nil && !os.IsNotExist(err) {
-			return err
+			return 0, err
 		}
 		e.state.Delete(task.RelPath)
 
 	case ActionDeleteR:
 		if err := e.client.DeleteFile(remoteFullPath); err != nil {
-			return err
+			return 0, err
 		}
 		e.state.Delete(task.RelPath)
 
 	case ActionConflict:
-		// 冲突解决：将本地文件重命名为 conflict 备份，再下载远端版本
 		timestamp := time.Now().Format("20060102-150405")
 		ext := filepath.Ext(localFullPath)
 		base := strings.TrimSuffix(localFullPath, ext)
@@ -382,8 +416,13 @@ func (e *Engine) executeTask(task SyncTask) error {
 		_ = os.Rename(localFullPath, conflictPath)
 		log.Printf("[冲突处理] 本地版本已备份为: %s", conflictPath)
 
-		if err := e.client.DownloadFile(remoteFullPath, localFullPath); err != nil {
-			return err
+		var expected int64
+		if task.Remote != nil {
+			expected = task.Remote.Size
+			transferredSize = expected
+		}
+		if err := e.client.DownloadFile(remoteFullPath, localFullPath, expected); err != nil {
+			return 0, err
 		}
 		info, err := os.Stat(localFullPath)
 		if err == nil {
@@ -391,5 +430,18 @@ func (e *Engine) executeTask(task SyncTask) error {
 		}
 	}
 
-	return nil
+	return transferredSize, nil
+}
+
+func FormatBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
